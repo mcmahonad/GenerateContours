@@ -1,5 +1,5 @@
-
-# This script clips batch downloaded DEM tiles to a geographic area of interest and creates contour line tiles from them
+# This script clips batch downloaded DEM tiles to a geographic area of interest and creates contour line tiles from them.
+# requires pandas and arcpy installations
 
 # ------------------------------------------------------------------------------------------------------------------------------------
 
@@ -8,46 +8,20 @@
 # ------------------------------------------------------------------------------------------------------------------------------------
 
 '''
-11/10 notes: 
-    - Break up lines to improve performance. ArcGIS handles more features better than more vertices. 
-        - This was done in the past by erasing annotation bounding boxes from lines to break them up
-            - (also creates nice contour annotation)
-        - Could also try to reduce vertices in the contour step
-    - Read the 2002 contour generalization documentation for generalization tips.
-        - generalize line tool trials
-        - Try larger cell sizes 
-
-    - Ownership/QC: these would be EE owned files assuming that 2002 contours are also EE owned.
-        - Need to make sure datums are being tracked. 
-        - Accuracy-wise, these would come with a disclaimer
-        - Would wind up in SDE, so vtpk not an option. 
-
-11/12 notes:
-
-Experimented with line smoothing and generalization. Tried smoothing with larger cell sizes and focal statistics. Tried reducing vertices with generalize. 
-
-Results below: 
-
-Raw contours, 1m cell size = 1720 vertices
-
-Raw contours, 5m cell size = 599 vertices
-
-Raw contours, 5m cell size, 1ft generalization = 154 vertices
-
-Focal stats (3 cells) 1m cell size = 1974 vertices
-
-Simplify Line, 1m cell size, tolerance = 0.1 (meters?) = 477 vertices
-
-11/19:
-Tile clip and merge steps completed. Ran 100 tile merge. Performance worse than 2002 with current settings.
-    - upside is that no snapping needed with such low simplification tolerance. 
-    - Continue to tweak smoothing/generalization scheme. Bend line adds vertices. 
-        - if it is needed, try polygon neighbors tool or near.
-    - still need final clip to municipal boundary. 
+11/29: 5 ft contour creation complete. 
+    478,000 features with avg. of 41.2 vertices = 19.7 million vertices
+    compare to contours 2002: 457,000 features with avg. of 237.2 vertices = 108.4 million vertices
+        - despite the big drop in vertices draw time still appears faster for 2002 contours?
+    Some gaps along edge of tiles - not enough to be concerned about, but appear to have been created
+    during focal statistics DEM resampling. 
+Next steps:
+    - test performance for smaller intervals? 2 ft desired but need at least 4 ft
+        - 'memory leak' handling needed. Not explicitly saving to memory workspace but processing time greatly increases at higher iterations. 
+    - confirm vertical and horizontal datum correct with no issues. 
 '''
 # ------------------------------------------------------------------------------------------------------------------------------------
 #
-# --------------------------------------------- Imports, set environments/inputs -----------------------------------------------------
+# ------------------------------------ Imports, set environments/inputs/workspaces --------------------------------------------
 #
 # ------------------------------------------------------------------------------------------------------------------------------------
 
@@ -58,38 +32,42 @@ import pandas as pd
 import os
 import datetime
 from datetime import date
+import sys
+sys.path.append(placeholder1)
+import apshorthand as aps # personal module for reducing verbosity of arcpy function calls in terminal
+
 
 # Prevent file clutter during tests
 env.overwriteOutput = True
 
-# Desired smoothing tolerance for line simplication algorithim. Very small values still produce big reductions in points. 
-simpTolerance = 0.1
+# Desired smoothing tolerance for line simplication algorithim. Very small values still produce big reductions in contour vertices. 
+simpTolerance = "0.5 Feet"
 
 # Desired contour interval in feet
 interval = 5
 
-# tile overlap distance in meters. Overlap distance set to > than smoothing tolerance.
+# tile overlap distance in meters. 
 tileOverlap = "10 meters"
 
-# Set cell size in feet for the merged DEM. Use this to smooth contours.
+# Set cell size for the merged DEM. Values larger than the input raster cell size will smooth contours
 cellSize = 1
 
 # Set workspace and export locations. Create these directories ahead of time. 
 # contains DEM tiles downloaded from VGIN. Script currently configured for .img
-RawDEMFolder = r""
+rawDEMFolder = placeholder2
 
 # contains overlapping DEM tiles created from the mosaic merge and re-split. 
-splitDEMFolder = r""  
+outDEMFolder = placeholder3  
 
 # contains working data created by the tile overlaps
-workingFolder = r""
+workingFolder = placeholder4
 
 # GDB containing working data (for now just mosaics). Nested under workingFolder. Mosaic dataset must go into a gdb. 
 workingDB = 'Working.gdb'
 workingGDBPath = workingFolder + "\\" + str(workingDB)
 
 # contains output contours. Export fails if this is nested under the working folder. 
-contourExportLoc = r""
+contourExportLoc = workingFolder
 contourGDB = 'Working.gdb'
 contourGDBPath = contourExportLoc +"\\"+ str(contourGDB)
 
@@ -100,7 +78,7 @@ contourGDBPath = contourExportLoc +"\\"+ str(contourGDB)
 # ------------------------------------------------------------------------------------------------------------------------------------
 
 # Set workspace to folder containing DEM tiles and create list of rasters
-env.workspace = RawDEMFolder
+env.workspace = rawDEMFolder
 
 rasList = arcpy.ListRasters()
 
@@ -110,13 +88,12 @@ rasList = arcpy.ListRasters()
 # The tile names are included in the footprints csv and will be used to delete unwanted tiles. 
 
 # Read downloaded footprints table
-footprintTable = pd.read_csv(r"")
+footprintTable = pd.read_csv(placeholder5)
 # extract tile names and convert to a list. Append raster file extension. 
 footprintNames = list(footprintTable['Name'])
 footprintNames = [footprint + ".img" for footprint in footprintNames]
 
-# Verify that your rasters match the list of raster names so they aren't deleted accidentally. 
-# A little clunky. Better ways to verify than list length. Also is for loop even needed? 
+# Verify that rasters match the list of raster names so they aren't deleted accidentally. 
 rasLen = []
 for ras in rasList:
     if ras in footprintNames:
@@ -125,7 +102,6 @@ for ras in rasList:
         pass
 
 # delete all rasters in the DEM tile folder that aren't listed in the footprints list.
-# Also a little clunky
 if len(rasLen) == len(footprintNames):
     for ras in rasList:
         if ras not in footprintNames:
@@ -140,17 +116,17 @@ else:
 # --------------------------------------------------------- create tile overlaps --------------------------------------------------------
 #
 # ---------------------------------------------------------------------------------------------------------------------------------------
-
-# creating contours from the raw VGIN tiles creates gaps at the boundary of each tile and sometimes interpolates poorly along those gaps.
-# in order to rectify, overlaps need to be created between tiles so that the contours cover the gaps.
-# handle this by merging the tiles, resplit into new tiles with an overlap, create contours, and then clip to original tile boundaries. 
-
-# Create mosaic -> Load datasets to mosaic -> Mosaic to new raster -> Export mosaic dataset geo -> Buffer -> Split raster
+'''
+creating contours from the raw VGIN tiles creates gaps at the boundary of each tile and sometimes interpolates poorly along those gaps.
+in order to rectify, overlaps need to be created between tiles so that the contours cover the gaps.
+handle this by merging the tiles, resplit into new tiles with an overlap, create contours, and then clip to original tile boundaries. 
+'''
+# create mosaic -> load datasets to mosaic -> mosaic to new raster -> export mosaic dataset footprints -> buffer footprints -> split raster with buffered footprints
 
 # the list of rasters in the workspace should be shorter after deleting unneeded ones.
 rasListReduced = arcpy.ListRasters()
-# create subset for testing. Remove index if running on whole dataset.  
-rasSub = rasListReduced[0:99]
+# create subset for testing. Remove index if running the whole dataset.  
+rasSub = rasListReduced
 
 # create mosaic from the remaining tiles and load them in
 rasMosaic = arcpy.management.CreateMosaicDataset(workingGDBPath, "workingMosaic_" + str(date.today()), arcpy.Describe(rasSub[0]).spatialReference, 1, "32_BIT_FLOAT")
@@ -166,35 +142,41 @@ arcpy.management.MosaicToNewRaster(rasSub, workingFolder, rasMerge, arcpy.Descri
 bufferedFootprints = os.path.join(workingFolder, "Bufferedfootprints_" + str(date.today()))
 arcpy.Buffer_analysis(outFootprintPath + ".shp", bufferedFootprints, tileOverlap, "FULL")
 
-# split raster into overlapping tiles using the buffered footprints.
+# split raster into overlapping tiles using the buffered footprints. Run focal statistics for DEM smoothing. 
 outNameFormat = "Split_" + str(date.today()).replace("-", "_")
-arcpy.management.SplitRaster(in_raster = os.path.join(workingFolder, rasMerge), out_folder = splitDEMFolder, out_base_name = outNameFormat + "_", split_method = "POLYGON_FEATURES", format = "IMAGINE IMAGE", resampling_type = "BILINEAR", split_polygon_feature_class = bufferedFootprints + ".shp") 
+arcpy.management.SplitRaster(in_raster = os.path.join(workingFolder, rasMerge), out_folder = outDEMFolder, out_base_name = outNameFormat + "_", split_method = "POLYGON_FEATURES", format = "IMAGINE IMAGE", resampling_type = "BILINEAR", split_polygon_feature_class = bufferedFootprints + ".shp") 
+
+env.workspace = outDEMFolder
+
+rasSplit = arcpy.ListRasters()
+
+for ras in rasSplit:
+    focalRas = arcpy.ia.FocalStatistics(ras, "Rectangle 3 3 CELL", "MEAN")
+    focalRas.save(outDEMFolder + "\\Focal\\Focal_" + ras)
 
 # ---------------------------------------------------------------------------------------------------------------------------------------
 #
 # ------------------------------------------------------ create contours from tiles -----------------------------------------------------
 #
 # ---------------------------------------------------------------------------------------------------------------------------------------
+# set workspace to the procressed DEM tiles -> create contours -> delete noise -> reduce vertices -> clip to original (unbuffered) footprints -> merge
 
-env.workspace = splitDEMFolder
-
-# following loop fails with dashes in file names. This gets split up above at split raster step. Needed here too?
-rasSplit = [ras.replace("-", "_") for ras in arcpy.ListRasters()]
-rasSplit = arcpy.ListRasters()
+env.workspace = os.path.join(outDEMFolder, "Focal")
+procRasSplit = arcpy.ListRasters()
 
 # get start time of loop execution and indicate which tile is being processed. 
-
 startTime = time.time()
 counter = 1
+
+# create list of rasters to be merged 
 contourMergeList = []
 
-
-for ras in rasSplit:
-    print(f"processing tile {counter} of {len(rasSplit)}")
+for ras in procRasSplit:
+    print(f"processing tile {counter} of {len(procRasSplit)}")
     outContour = os.path.join(contourGDBPath, "raw_" + ras.split(".")[0])
-    arcpy.sa.Contour(in_raster = ras, out_polyline_features = outContour, contour_interval = interval, z_factor = 3.28084)
+    arcpy.sa.Contour(in_raster = ras, out_polyline_features = outContour, contour_interval = interval, z_factor = 3.28084, max_vertices_per_feature = 400)
 
-    # Delete noise - contours under 20 ft length. Select by attribute probably faster than iterating? 
+    # Delete noise - contours under 20 ft length.
     trimContours = arcpy.management.SelectLayerByAttribute(outContour, "NEW_SELECTION", "shape_Length < 20")
     arcpy.DeleteFeatures_management(trimContours)
 
@@ -203,7 +185,7 @@ for ras in rasSplit:
     outSimp = arcpy.SimplifyLine_cartography(in_features = outContour, out_feature_class = outSimpPath, algorithm = "POINT_REMOVE",
                                     tolerance = simpTolerance, error_resolving_option = "RESOLVE_ERRORS", collapsed_point_option = "NO_KEEP")
 
-    # Clip contours back down to the original footprints. Need to select each footprint using mean centers derived from contour tiles.
+    # Clip contours back down to the original footprints. Select each footprint using mean centers derived from contour tiles.
     footprintSelectorPath = os.path.join(contourGDBPath, "meanCenter" + ras.split(".")[0])
     footprintSelector = arcpy.MeanCenter_stats(outSimp, footprintSelectorPath)
 
@@ -214,13 +196,13 @@ for ras in rasSplit:
 
     contourMergeList.append(clipContour)
     
-    # record next iteration
+    # tile complete, record next iteration
     counter = counter + 1
 
 # get loop runtime in seconds after completion
 executionTime = time.time() - startTime
-print(f"created {len(rasSplit)} tiles with {interval} ft contour interval in {round(executionTime, 4)} sec ({round(executionTime/len(rasSplit),4)} sec/tile)")
+print(f"created {len(procRasSplit)} tiles with {interval} ft contour interval in {round(executionTime, 4)} sec ({round(executionTime/len(procRasSplit),4)} sec/tile)")
 
-# merge contours into final output
+# merge contours. Handling final clip in ArcGIS Pro. 
 finalMergePath = os.path.join(contourGDBPath, "_contours" + str(interval) + "_ft")
 arcpy.Merge_management(contourMergeList, finalMergePath)
