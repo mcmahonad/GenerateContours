@@ -15,9 +15,15 @@ import os
 import datetime
 from datetime import date
 import sys
-sys.path.append("MODULE_LOCATION")
-from apshorthand import * # personal module for more convenient arcpy function call syntax in terminal
 
+# file paths go in configuration file
+import configparser
+configPath = os.path.join(os.getcwd(), "WorkspaceConfig.ini")
+config = configparser.ConfigParser()
+config.read(configPath)
+
+sys.path.append(config['MODULES']['apshorthand'])
+from apshorthand import * # personal module for more convenient arcpy function call syntax in terminal
 
 # Allow overwriting output to prevent file clutter during tests
 env.overwriteOutput = True
@@ -36,13 +42,13 @@ cellSize = 1
 
 # Set workspace and export locations.
 # contains DEM tiles downloaded from VGIN. Script currently configured for .img
-rawDEMFolder = "INPUT_DEM_LOCATION"
+rawDEMFolder = config['FOLDERS']['rawDEMFolder']
 
-# contains overlapping DEM tiles created from the mosaic merge and re-split. 
-outDEMFolder = "OUTPUT_DEM_LOCATION"
+# contains overlapping DEM tiles created from the mosaic merge and re-split.
+outDEMFolder = config['FOLDERS']['outDEMFolder'] 
 
 # contains working data created by the tile overlaps
-workingFolder = "WORKING_FOLDER"
+workingFolder = config['FOLDERS']['workingFolder']
 
 # GDB containing working mosaics. Nested under workingFolder. Mosaic dataset must go into a gdb. 
 workingDB = 'Working.gdb'
@@ -66,11 +72,12 @@ rasList = arcpy.ListRasters()
 
 # No need to run this section after the first run.
 '''
-# Before running script, create a mosaic dataset in Pro and add DEM tiles. Once generated, select footprints intersecting the area of interest and export these to the csv below
+# Before running script, create a mosaic dataset in Pro and add DEM tiles.
+# Once generated, select footprints intersecting the area of interest and export these to the csv below
 # The tile names are included in the footprints csv and will be used to delete unwanted tiles. 
 
 # Read downloaded footprints table
-footprintTable = pd.read_csv("FOOTPRINT_LOCATION")
+footprintTable = pd.read_csv(config['FOLDERS']['footprintTable'])
 # extract tile names and convert to a list. Append raster file extension. 
 footprintNames = list(footprintTable['Name'])
 footprintNames = [footprint + ".img" for footprint in footprintNames]
